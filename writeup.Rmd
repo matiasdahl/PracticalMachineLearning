@@ -1,0 +1,283 @@
+---
+title: "Predicting if an exercise is done correctly using sensor data"
+output: html_document
+---
+
+***Summary.*** *The paper [1] describes the measurement of subjects that lift a light (1.25kg) dumbbell. Ten male persons (age 20-28) each did a series of Unilateral Dumbbell Biceps Curls. These were done in the presence of an experienced weight lifter, and each lift was done either in the correct way or in one of four incorrect ways. The data was obtained using four sensors placed on the equipment: on the dumbbell, the belt, the glove and on an armband around the upper arm. Each sensor had 9 degrees of freedom (acceleration, gyroscope and magnetometer) and was sampled at 45Hz via Bluetooth, see [1].*
+
+*The purpose of this course project is to use such sensor readings to built a classifier that recognizes the five motion alternatives. Using a random forest classifier, we construct a method that has a comparable accuracy to a classifier mentioned in the original paper (also a random forest).*
+
+##1. Loading and cleaning the data
+
+The following loads the dataset provided on the course homepage:
+
+```{r}
+training <- read.csv("pml-training.csv", sep=",",  header = TRUE)
+dim(training)
+```
+
+The data has `r dim(training)[[1]]` rows (measurements) and `r dim(training)[[2]]` columns (features). It is thus smaller than the [original dataset](http://groupware.les.inf.puc-rio.br/static/WLE/WearableComputing_weight_lifting_exercises_biceps_curl_variations.csv), which has 39243 rows. Nevertheless, due to its large size, the data is most easily inspected by importing it into a spreadsheet software, or, by using R Studio's interactive `View` command. The columns divide into three types. First, there are 8 columns that record various aspects of the experimental setup. We will here develop a classifier that only uses sensor readings. We therefore discard these columns. For example, they identify the first names of the subjects. The columns are:
+
+```{r}
+columns_to_delete <- c('X', 'user_name', 'raw_timestamp_part_1', 'raw_timestamp_part_2', 
+                    'cvtd_timestamp', 'new_window', 'num_window', 'rows')
+```
+
+Let us emphasize that the above choice removes all timing information from the data. This will result in a model that neither involve time.
+
+The remaining `160-8=152` columns record sensor data for the exercises. The motion type is recorded in the column `classe`, which can take 5 values: A (exercise is done correctly) and B, C, D, E for the four incorrect ways of doing the exercise. The remaining columns record data on two time-scales. Some of the columns have data on all rows while others are recorded less frequently and seem to be related to various statistics. Below this is illustrated with the first 30 values for the columns `pitch_belt` and `avg_pitch_belt`:
+
+```{r}
+training$pitch_belt[1:30]
+training$avg_pitch_belt[1:30]
+```
+
+Due to this structure in the data, we simplify it by removing all non-numeric columns. We also remove the columns collected earlier in `columns_to_delete`. The only exception is the `classe`-column which is not removed. This contains the labels we aim to predict. 
+
+```{r}
+clean_df <- function(df) {
+    # Helper function: returns TRUE if input vector has any NA:s.
+    has_an_NA <- function(v) { any(sapply(v, function(x) is.na(x))) }    
+    
+    keep_column <- function(c_name) { 
+        # Keep column with correct class labels
+        if (c_name == 'classe') {
+            return(TRUE)
+        }
+       
+        # Do not keep columns already marked for deletion.
+        if (c_name %in% columns_to_delete) {
+            return(FALSE)
+        }
+       
+        # Keep columns that are all numeric. Discard the rest.
+        column <- df[ , as.character(c_name)]
+        return(is.numeric(column) && !has_an_NA(column))
+   }
+
+   return(df[, sapply(colnames(df), keep_column )])
+}  
+training <- clean_df(training)
+dim(training)
+```
+
+We have now cleaned the data, and from the original 160 columns 53 remain. For completeness, the below lists the columns that remain, and for each column the entries of the first few rows are listed. Apart from the `classe`-column, the data frame is numeric and contains no `NA`s.
+
+```{r}
+str(training)
+```
+
+##2. Splitting the data for training and evaluation
+
+The analysis is done using the `caret` package for machine learning in R. We also load the `doMC` package for using multiple cores. 
+
+```{r, warning=FALSE, message=FALSE, echo=TRUE}
+library(caret)
+library(doMC)
+registerDoMC(cores = 16)
+```
+
+The data in the `training` data frame (with `r dim(training)[[1]]` rows) is divided into three parts using a (60%, 20%, 20%) split:
+
+- `training_data` (60%): This data frame is used to train all models.
+
+- `validation_data` (20%): This data frame is used to compare models against each other.
+
+- `final_test_data` (20%): This data frame is used to estimate the error of the final model.
+
+```{r, warning=FALSE, echo=TRUE}
+set.seed(22)
+training$classe <- as.factor(training$classe)
+div1 = createDataPartition(1:nrow(training), p = 60/100, list = FALSE)
+training_data = training[div1, ]
+rest_data = training[-div1, ]
+div2 = createDataPartition(1:nrow(rest_data), p = 50/100, list = FALSE)
+validation_data = rest_data[div2, ]
+final_test_data = rest_data[-div2, ]
+```
+
+The number of rows in the three data frames are:
+
+```{r, warning=FALSE, echo=TRUE}
+c(nrow(training_data), nrow(validation_data), nrow(final_test_data))
+```
+
+## 3. Four Models
+
+Below we evaluate four models fitted to `training_data`. The first model is a [random forest](https://en.wikipedia.org/wiki/Random_forest). This method was also used in the original paper [1]. The second model is a CART [Classification And Regression Tree](https://en.wikipedia.org/wiki/Decision_tree_learning) decision tree. The third and fourth models are similar to the first two but they include additional features.
+
+Before constructing the models we make two observations. First, finding models is computationally expensive. It is therefore convenient to cache (save to disk) models that have already been computed. To do this we define the following helper function:
+
+```{r, message=FALSE}
+cache_model <- function(file_name, compute_model) {
+    if (file.exists(file_name)) {
+        # Model has already been computed and saved to disk. 
+        # Load and return it.
+        return(readRDS(file_name))
+    }  
+    # Model has not been computed. Compute it, save it to disk, and return it.
+    set.seed(22)
+    result <- compute_model()
+    saveRDS(result, file_name)
+    return(result)
+}
+```
+
+Second, the default resampling method for `caret` is bootstrapping, but below we use the `repeatedcv` method with 15 number of folds and three repeats. In this analysis the choice of resampling method might not be very central since the original data is split into three separate parts: One part is reserved for training, one for comparing models, and one for computing the final accuracy. We therefore do not estimate accuracy using data that has already been used for training or model selection. While higher numbers for the number of folds and repeats will lead to more iterations over the data, and possibly better accuracy, that will also slow down the computation. The choice of `repeats` = 3 and `numbers` = 15 were found to give a reasonable computation time on a fast multicore computer. To speed up the computation these numbers can be decreased.
+
+```{r, message=FALSE}
+ctrl = trainControl(method = "repeatedcv", repeats = 3, number = 15)
+```
+
+### 3.1 -- Model 1 (Random forest)
+
+The below uses `caret`s train method to create a random forest fitted to `training_data`:
+
+```{r, message=FALSE}
+compute_rf <- function() { 
+    train(classe ~. , data = training_data, 
+          method = "rf",
+          trControl = ctrl)
+}
+
+model_rf <- cache_model("model_rf.rds", compute_rf)
+```
+
+To analyze the performance of this model we evaluate the model's performance on the validation set, which was not used when training the model.
+
+```{r, message=FALSE}
+predicted_classes <- predict(model_rf, newdata = validation_data)
+confusionMatrix(data = predicted_classes, 
+                reference = validation_data$classe)
+```
+
+### 3.2 -- Model 2 (Decision tree)
+
+The below creates a CART decision tree, and it is evaluated in the same way as above using the validation set.
+
+```{r, message=FALSE}
+compute_rpart <- function() { 
+    train(classe ~. , data = training_data, trControl = ctrl, method = "rpart")
+}
+
+model_rpart <- cache_model("model_rpart.rds", compute_rpart)
+predicted_classes <- predict(model_rpart, 
+                             newdata = validation_data)
+confusionMatrix(data = predicted_classes, 
+                reference = validation_data$classe)
+```
+
+An advantage of decision trees is that they can be plotted as shown below. From this plot one can explicitly see how the model depends on only only four decisions:
+
+```{r, message=FALSE}
+library(rattle)
+fancyRpartPlot(model_rpart$finalModel, sub = "")
+```
+
+### 3.3 -- Model 3 (Random forest with added features)
+
+The above two models use the 52 features in the cleaned data. From the random forest model one can obtain a list of those features that are rated as most important:
+
+```{r}
+varImp(model_rf)
+```
+
+The third and fourth model are constructed by adding features. These features are created by pairwise multiplying the 7 most important features (according to the above list). This will add `7 choose 2 = 7*6/2 = 21` features to the data.
+
+```{r}
+key_columns <- c('roll_belt', 'pitch_forearm', 
+                 'yaw_belt', 'pitch_belt', 'roll_forearm', 
+                 'magnet_dumbbell_y', 'magnet_dumbbell_z')
+
+add_features <- function(df) {
+    for (i in 1:length(key_columns)) {
+        for (j in 1:length(key_columns)) {
+            c1 = as.character(key_columns[i])
+            c2 = as.character(key_columns[j])
+            if (i<j) {
+                new_col = as.character(paste0(c1, "_times_", c2))
+                df[, new_col] <- df[ ,c1] * df[ ,c2]        
+            }
+        }
+    }   
+    return(df)
+}
+dim(add_features(training_data))
+```
+
+Apart from the additional features, the random forest is computed and evaluated as before:
+
+```{r, message=FALSE}
+compute_rf2 <- function() {
+    train(classe ~. , 
+          data = add_features(training_data), 
+          trControl = ctrl,
+          method = "rf")
+}
+model_rf2 <- cache_model("model_rf2.rds", compute_rf2)
+predicted_classes <- predict(model_rf2, 
+                             newdata = add_features(validation_data))
+confusionMatrix(data = predicted_classes, 
+                reference = add_features(validation_data)$classe)
+```
+
+It is instructive to again show the features that the new model rate as most important. This shows that the new model makes use of the new features.
+
+```{r}
+varImp(model_rf2)
+```
+
+### 3.4 -- Model 4 (Decision tree, added features)
+
+The below model is identical to the first decision tree model except that -- as in the previous model -- it also uses the additional features. 
+
+```{r, message=FALSE}
+compute_rpart2 <- function() { 
+    train(classe ~. , 
+          data = add_features(training_data), 
+          trControl = ctrl,
+          method = "rpart")
+}
+model_rpart2 <- cache_model("model_rpart2.rds", compute_rpart2)
+predicted_classes <- predict(model_rpart2, 
+                             newdata = add_features(validation_data))
+confusionMatrix(data = predicted_classes, 
+                reference = add_features(validation_data)$classe)
+```
+
+Similar to the first decision tree, the above model (with added features) never outputs `D`. Plotting the decision tree shows that the new model also makes use of the new features.
+
+```{r}
+fancyRpartPlot(model_rpart2$finalModel, sub = "")
+```
+
+## 4. Selecting a final model
+
+From the above list of four classifiers it is clear that the random forest models outperform the (simple) decision trees. However, comparing the two random forests is less obvious. Model 3 (with the added features) is more involved. However, Model 3 yields a very slightly higher overall accuracy (`99.18%` accuracy compared with `99.08%` on the validation set). When comparing these models, we should also take into account the original problem. To avoid injury, we should put more penalty on false positive outcomes than false negatives. That is, we should more strongly penalize  outcomes where the classifier determines the exercise to be done correctly, while it was not. Also on this criterion Model 3 is very slightly better than Model 1. As a final model, we therefore choose Model 3. 
+
+**Evaluation.** On the final test set, Model 3 performs as follows: 
+
+```{r}
+predicted_classes <- predict(model_rf2, 
+                             newdata = add_features(final_test_data))
+confusionMatrix(data = predicted_classes, 
+                reference = add_features(final_test_data)$classe)
+```
+
+On the final test set, the overall accuracy is `98.08%` (with corresponding error rate `0.92%`). This is comparable to the accuracy reported in [1]. Since the above evaluation is the first time `final_test_data` is used, we should expect `98.08%` to be a reasonable estimate of how accurate the model performs on unseen data. However, here it should be emphasized that all three datasets (`training_data`, `validation_data` and `finale_test_data`) arise from measuring only ten persons using a fixed measuring setup. We should therefore expect that the same person's sensor data appear in all three data sets, and the accuracy of `98.8%` might not be realistic if the classifier is used on measurements from a new person not already in the dataset. 
+
+To address the above, a more realistic way to estimate the real accuracy would be resample using a leave-one-person-out scheme for training and evaluation. This will allows one to estimate how well the model generalizes to persons not in the dataset. For details, see [1]. In this setting, the paper reports the lower accuracy of `78.2%`.
+
+**Performance on test set.** For the course evaluation, a data set of 20 unlabeled features was provided. Predicting the labels for these features give:
+
+```{r}
+to_predict <- read.csv("pml-testing.csv", sep = ",",  header = TRUE)
+dim(training)
+answers = as.character(predict(model_rf2, newdata = add_features(clean_df(to_predict))))
+answers
+```
+
+## References
+
+**[1]** Velloso, E.; Bulling, A.; Gellersen, H.; Ugulino, W.; Fuks, H. [*Qualitative Activity Recognition of Weight Lifting Exercises.*](http://groupware.les.inf.puc-rio.br/har#ixzz3gv1KD6yj) Proceedings of 4th International Conference in Cooperation with SIGCHI (Augmented Human '13). Stuttgart, Germany: ACM SIGCHI, 2013.
+
