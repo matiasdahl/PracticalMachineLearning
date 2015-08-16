@@ -1,7 +1,13 @@
 ---
 title: "Predicting if an exercise is done correctly using sensor data"
-output: html_document
+output:
+  html_document:
+    keep_md: true
 ---
+
+```{r global_options, include=FALSE}
+knitr::opts_chunk$set(fig.path='images/')
+```
 
 ***Summary.*** *The paper [1] describes the measurement of subjects that lift a light (1.25kg) dumbbell. Ten male persons (age 20-28) each did a series of Unilateral Dumbbell Biceps Curls. These were done in the presence of an experienced weight lifter, and each lift was done either in the correct way or in one of four incorrect ways. The data was obtained using four sensors placed on the equipment: on the dumbbell, the belt, the glove and on an armband around the upper arm. Each sensor had 9 degrees of freedom (acceleration, gyroscope and magnetometer) and was sampled at 45Hz via Bluetooth, see [1].*
 
